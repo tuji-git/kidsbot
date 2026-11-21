@@ -51,8 +51,11 @@ def _validate(data):
 
 
 BASE = "https://generativelanguage.googleapis.com/v1beta"
-BAD_WORDS = ("lite", "image", "tts", "audio", "live", "embed", "exp", "thinking",
+# models we never want (not text generators)
+BAD_WORDS = ("image", "tts", "audio", "live", "embed", "exp", "thinking",
              "robotics", "computer", "learnlm", "gemma", "vision", "aqa")
+ROUNDS = 4          # how many full passes over the model list
+TIMEOUT = 45        # seconds per request
 
 
 def _version_key(name):
@@ -62,7 +65,8 @@ def _version_key(name):
 
 
 def list_candidates(key):
-    """Ask Google which models this key can use, newest stable 'flash' first."""
+    """Ask Google which models this key can use. Order: stable newest first,
+    previews next, 'lite' models last (cheaper and usually less busy = good fallback)."""
     forced = os.getenv("GEMINI_MODEL", "").strip()
     if forced:
         return [forced.removeprefix("models/")]
@@ -79,37 +83,51 @@ def list_candidates(key):
                 names.append(name)
     except Exception as e:
         print(f"[generate] could not list models: {e}")
-    # stable names first (no 'preview'), then newest version
-    names.sort(key=lambda n: ("preview" in n, tuple(-x for x in _version_key(n)), n))
+    names.sort(key=lambda n: ("lite" in n, "preview" in n,
+                              tuple(-x for x in _version_key(n)), n))
     return names or [config.GEMINI_MODEL]
 
 
-def make_script(topic, avoid_titles, retries=2):
+def make_script(topic, avoid_titles):
     key = os.environ["GEMINI_API_KEY"]
     body = {
         "contents": [{"parts": [{"text": _prompt(topic, avoid_titles)}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9},
     }
-    candidates = list_candidates(key)
-    print(f"[generate] models to try: {candidates[:4]}")
+    allc = list_candidates(key)
+    # keep the 4 best normal models + 2 'lite' fallbacks (lite is cheaper and usually less busy)
+    candidates = [m for m in allc if "lite" not in m][:4] + [m for m in allc if "lite" in m][:2]
+    print(f"[generate] models to try: {candidates}")
+    dead = set()          # models that answered 404/403: skip them in later rounds
     last_err = None
-    for model in candidates[:5]:
-        url = f"{BASE}/models/{model}:generateContent"
-        for attempt in range(1, retries + 1):
+    for rnd in range(1, ROUNDS + 1):
+        alive = [m for m in candidates if m not in dead]
+        if not alive:
+            break
+        for model in alive:
+            url = f"{BASE}/models/{model}:generateContent"
             try:
-                r = requests.post(url, json=body, headers={"x-goog-api-key": key}, timeout=90)
-                if r.status_code in (404, 429, 403):   # model missing / no quota: try the next model
+                r = requests.post(url, json=body, headers={"x-goog-api-key": key}, timeout=TIMEOUT)
+                if r.status_code in (404, 403):
+                    dead.add(model)                        # gone or not allowed: never retry
                     last_err = f"{model}: HTTP {r.status_code}"
-                    print(f"[generate] {last_err} -> next model")
-                    break
+                    print(f"[generate] {last_err} (skipping this model)")
+                    continue
+                if r.status_code == 429 or r.status_code >= 500:
+                    last_err = f"{model}: HTTP {r.status_code} (busy/quota)"
+                    print(f"[generate] round {rnd}: {last_err}")
+                    continue                               # try the next model
                 r.raise_for_status()
                 text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                 text = text.strip().removeprefix("```json").removesuffix("```").strip()
                 data = _validate(json.loads(text))
-                print(f"[generate] OK with model {model}")
+                print(f"[generate] OK with model {model} (round {rnd})")
                 return data
-            except Exception as e:  # bad JSON, network...
+            except Exception as e:                         # timeout, bad JSON, network...
                 last_err = f"{model}: {e}"
-                print(f"[generate] attempt {attempt} failed: {last_err}")
-                time.sleep(4 * attempt)
+                print(f"[generate] round {rnd}: {last_err}")
+        if rnd < ROUNDS:
+            wait = 20 * rnd                                # 20s, 40s, 60s between rounds
+            print(f"[generate] all busy, waiting {wait}s before round {rnd + 1}...")
+            time.sleep(wait)
     raise RuntimeError(f"Gemini failed on all models. Last error: {last_err}")
