@@ -1,13 +1,12 @@
 """Step 1: ask Gemini to write the story script as JSON."""
 import json
 import os
+import re
 import time
 
 import requests
 
 import config
-
-API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
 def _prompt(topic, avoid_titles):
@@ -51,23 +50,66 @@ def _validate(data):
     return data
 
 
-def make_script(topic, avoid_titles, retries=3):
+BASE = "https://generativelanguage.googleapis.com/v1beta"
+BAD_WORDS = ("lite", "image", "tts", "audio", "live", "embed", "exp", "thinking",
+             "robotics", "computer", "learnlm", "gemma", "vision", "aqa")
+
+
+def _version_key(name):
+    """gemini-2.5-flash -> (2, 5); used to prefer the newest model."""
+    m = re.search(r"gemini-(\d+)(?:\.(\d+))?", name)
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else (0, 0)
+
+
+def list_candidates(key):
+    """Ask Google which models this key can use, newest stable 'flash' first."""
+    forced = os.getenv("GEMINI_MODEL", "").strip()
+    if forced:
+        return [forced.removeprefix("models/")]
+    names = []
+    try:
+        r = requests.get(f"{BASE}/models", params={"pageSize": 200},
+                         headers={"x-goog-api-key": key}, timeout=30)
+        r.raise_for_status()
+        for m in r.json().get("models", []):
+            name = m.get("name", "").removeprefix("models/")
+            if ("generateContent" in m.get("supportedGenerationMethods", [])
+                    and "gemini" in name and "flash" in name
+                    and not any(w in name for w in BAD_WORDS)):
+                names.append(name)
+    except Exception as e:
+        print(f"[generate] could not list models: {e}")
+    # stable names first (no 'preview'), then newest version
+    names.sort(key=lambda n: ("preview" in n, tuple(-x for x in _version_key(n)), n))
+    return names or [config.GEMINI_MODEL]
+
+
+def make_script(topic, avoid_titles, retries=2):
     key = os.environ["GEMINI_API_KEY"]
-    url = API.format(model=config.GEMINI_MODEL)
     body = {
         "contents": [{"parts": [{"text": _prompt(topic, avoid_titles)}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9},
     }
+    candidates = list_candidates(key)
+    print(f"[generate] models to try: {candidates[:4]}")
     last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.post(url, json=body, headers={"x-goog-api-key": key}, timeout=90)
-            r.raise_for_status()
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            text = text.strip().removeprefix("```json").removesuffix("```").strip()
-            return _validate(json.loads(text))
-        except Exception as e:  # network, quota, bad JSON...
-            last_err = e
-            print(f"[generate] attempt {attempt} failed: {e}")
-            time.sleep(5 * attempt)
-    raise RuntimeError(f"Gemini failed after {retries} attempts: {last_err}")
+    for model in candidates[:5]:
+        url = f"{BASE}/models/{model}:generateContent"
+        for attempt in range(1, retries + 1):
+            try:
+                r = requests.post(url, json=body, headers={"x-goog-api-key": key}, timeout=90)
+                if r.status_code in (404, 429, 403):   # model missing / no quota: try the next model
+                    last_err = f"{model}: HTTP {r.status_code}"
+                    print(f"[generate] {last_err} -> next model")
+                    break
+                r.raise_for_status()
+                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                text = text.strip().removeprefix("```json").removesuffix("```").strip()
+                data = _validate(json.loads(text))
+                print(f"[generate] OK with model {model}")
+                return data
+            except Exception as e:  # bad JSON, network...
+                last_err = f"{model}: {e}"
+                print(f"[generate] attempt {attempt} failed: {last_err}")
+                time.sleep(4 * attempt)
+    raise RuntimeError(f"Gemini failed on all models. Last error: {last_err}")
